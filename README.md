@@ -6,6 +6,7 @@ Features:
 - Automatic sorting by EXIF date (falls back to file modification time)
 - GPS-based filtering to exclude photos taken at different locations
 - Feature-based image alignment to stabilise the output
+- Tree-trunk detection mode for aligning photos around two trees
 - Date overlay on each frame
 - EXIF orientation handling
 
@@ -31,6 +32,8 @@ python3 timelapse.py /path/to/photos
 | `--no-gps-filter` | Disable GPS location filtering | |
 | `--gps-radius` | GPS filter radius in meters | `50` |
 | `--no-align` | Disable image alignment | |
+| `--tree-detect` | Detect two tree trunks for alignment and filtering | |
+| `--tree-debug` | Save debug images showing detected trunks | |
 
 ### Examples
 
@@ -38,4 +41,5 @@ python3 timelapse.py /path/to/photos
 python3 timelapse.py ~/garden-photos --output garden.mp4 --fps 12
 python3 timelapse.py ./photos --no-align --no-date
 python3 timelapse.py ./photos --gps-radius 100
+python3 timelapse.py ~/two-trees --tree-detect --tree-debug
 ```
