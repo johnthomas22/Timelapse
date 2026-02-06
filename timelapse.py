@@ -39,10 +39,6 @@ EXTENSIONS = {".jpg", ".jpeg", ".png", ".heic", ".webp"}
 # Tree-trunk detection parameters
 WORK_WIDTH = 960
 WORK_HEIGHT = 540
-MIN_TRUNK_HEIGHT_FRAC = 0.25
-MAX_TRUNK_WIDTH_FRAC = 0.35
-TRUNK_BOTTOM_FRAC = 0.7
-MIN_TRUNK_SEPARATION_FRAC = 0.2
 
 
 def _to_degrees(value) -> float:
@@ -203,92 +199,85 @@ def cv_to_pil(img: np.ndarray) -> Image.Image:
 
 
 def detect_trunks(image: np.ndarray) -> list[dict] | None:
-    """Detect two tree trunks in an image.
+    """Detect two tree trunks at the left and right edges of the frame.
 
-    Returns [left_trunk, right_trunk] dicts with centroid, bbox, bottom_center,
-    or None if two trunks cannot be reliably detected.
+    Uses column brightness profiling: the trunks are dark regions at the
+    left and right edges with a brighter gap between them.
+
+    Returns [left_trunk, right_trunk] dicts with centroid, inner_edge,
+    bottom_center, bbox, area — or None if the pattern isn't found.
     """
     work = cv2.resize(image, (WORK_WIDTH, WORK_HEIGHT))
     gray = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
 
-    # Find dark regions using two complementary methods
-    _, otsu_mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    adaptive_mask = cv2.adaptiveThreshold(
-        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV, blockSize=51, C=10
-    )
-    dark_mask = cv2.bitwise_and(otsu_mask, adaptive_mask)
+    # Use the upper-middle band where the sky gap is most visible
+    roi_top = int(WORK_HEIGHT * 0.1)
+    roi_bottom = int(WORK_HEIGHT * 0.6)
+    roi = gray[roi_top:roi_bottom, :]
 
-    # Morphological ops to isolate vertical structures
-    close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 15))
-    dark_mask = cv2.morphologyEx(dark_mask, cv2.MORPH_CLOSE, close_kernel)
-    erode_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 1))
-    dark_mask = cv2.morphologyEx(dark_mask, cv2.MORPH_OPEN, erode_kernel)
-    vert_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 15))
-    dark_mask = cv2.dilate(dark_mask, vert_kernel, iterations=1)
+    # Mean brightness per column
+    col_brightness = np.mean(roi, axis=0).astype(np.float64)
 
-    contours, _ = cv2.findContours(dark_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # Smooth heavily to get the broad dark-bright-dark pattern
+    kernel_size = WORK_WIDTH // 20
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+    smoothed = np.convolve(col_brightness, np.ones(kernel_size) / kernel_size, mode="same")
 
-    candidates = []
-    for contour in contours:
-        x, y, w, h = cv2.boundingRect(contour)
-        area = cv2.contourArea(contour)
+    # Threshold at the midpoint between min and max brightness
+    threshold = (np.min(smoothed) + np.max(smoothed)) / 2
 
-        if area < (WORK_WIDTH * WORK_HEIGHT * 0.005):
-            continue
-        if h < WORK_HEIGHT * MIN_TRUNK_HEIGHT_FRAC:
-            continue
-        if w > WORK_WIDTH * MAX_TRUNK_WIDTH_FRAC:
-            continue
-        if (y + h) < WORK_HEIGHT * TRUNK_BOTTOM_FRAC:
-            continue
-        if h / max(w, 1) < 1.0:
-            continue
+    # Scan from left to find where brightness first exceeds threshold
+    left_edge = None
+    for x in range(len(smoothed)):
+        if smoothed[x] > threshold:
+            left_edge = x
+            break
 
-        M = cv2.moments(contour)
-        if M["m00"] == 0:
-            continue
-        cx = M["m10"] / M["m00"]
-        cy = M["m01"] / M["m00"]
+    # Scan from right to find where brightness first exceeds threshold
+    right_edge = None
+    for x in range(len(smoothed) - 1, -1, -1):
+        if smoothed[x] > threshold:
+            right_edge = x
+            break
 
-        candidates.append({
-            "centroid": (cx, cy),
-            "bbox": (x, y, w, h),
-            "contour": contour,
-            "area": area,
-            "bottom_center": (x + w // 2, y + h),
-        })
-
-    if len(candidates) < 2:
+    if left_edge is None or right_edge is None:
         return None
 
-    candidates.sort(key=lambda c: c["area"], reverse=True)
-
-    best_pair = None
-    for i in range(len(candidates)):
-        for j in range(i + 1, min(len(candidates), 6)):
-            ci, cj = candidates[i], candidates[j]
-            if ci["centroid"][0] < cj["centroid"][0]:
-                left, right = ci, cj
-            else:
-                left, right = cj, ci
-
-            if left["centroid"][0] > WORK_WIDTH * 0.5:
-                continue
-            if right["centroid"][0] < WORK_WIDTH * 0.5:
-                continue
-
-            sep = right["centroid"][0] - left["centroid"][0]
-            if sep < WORK_WIDTH * MIN_TRUNK_SEPARATION_FRAC:
-                continue
-
-            combined = left["area"] + right["area"]
-            if best_pair is None or combined > best_pair[2]:
-                best_pair = (left, right, combined)
-
-    if best_pair is None:
+    # Validate the pattern
+    # Left edge (inner edge of left trunk) should be in left portion
+    if left_edge < WORK_WIDTH * 0.05 or left_edge > WORK_WIDTH * 0.45:
         return None
-    return [best_pair[0], best_pair[1]]
+    # Right edge (inner edge of right trunk) should be in right portion
+    if right_edge < WORK_WIDTH * 0.55 or right_edge > WORK_WIDTH * 0.95:
+        return None
+    # Must have a meaningful gap between the trunks
+    if (right_edge - left_edge) < WORK_WIDTH * 0.2:
+        return None
+    # The bright region between trunks must be significantly brighter than edges
+    gap_brightness = np.mean(smoothed[left_edge:right_edge + 1])
+    left_brightness = np.mean(smoothed[:max(left_edge, 1)])
+    right_brightness = np.mean(smoothed[min(right_edge, WORK_WIDTH - 2):])
+    edge_brightness = (left_brightness + right_brightness) / 2
+    if gap_brightness < edge_brightness * 1.3:
+        return None
+
+    left_trunk = {
+        "centroid": (left_edge / 2, WORK_HEIGHT / 2),
+        "bbox": (0, 0, left_edge, WORK_HEIGHT),
+        "bottom_center": (left_edge / 2, WORK_HEIGHT),
+        "inner_edge": left_edge,
+        "area": left_edge * WORK_HEIGHT,
+    }
+    right_trunk = {
+        "centroid": ((right_edge + WORK_WIDTH) / 2, WORK_HEIGHT / 2),
+        "bbox": (right_edge, 0, WORK_WIDTH - right_edge, WORK_HEIGHT),
+        "bottom_center": ((right_edge + WORK_WIDTH) / 2, WORK_HEIGHT),
+        "inner_edge": right_edge,
+        "area": (WORK_WIDTH - right_edge) * WORK_HEIGHT,
+    }
+
+    return [left_trunk, right_trunk]
 
 
 def compute_trunk_alignment(trunks: list[dict], ref_trunks: list[dict],
@@ -405,17 +394,19 @@ def pick_reference_with_trunks(photos: list[tuple[datetime, str]]) -> tuple[np.n
 
 def debug_draw_trunks(image: np.ndarray, trunks: list[dict] | None,
                       path: str, output_dir: str) -> None:
-    """Save a debug image with detected trunks highlighted."""
+    """Save a debug image with detected trunk inner edges highlighted."""
     vis = cv2.resize(image, (WORK_WIDTH, WORK_HEIGHT))
     if trunks is not None:
+        # Draw inner edge lines
+        left_x = trunks[0]["inner_edge"]
+        right_x = trunks[1]["inner_edge"]
+        cv2.line(vis, (left_x, 0), (left_x, WORK_HEIGHT), (0, 255, 0), 2)
+        cv2.line(vis, (right_x, 0), (right_x, WORK_HEIGHT), (0, 0, 255), 2)
+        # Draw centroids
         for i, t in enumerate(trunks):
-            color = (0, 255, 0) if i == 0 else (0, 0, 255)
-            x, y, w, h = t["bbox"]
-            cv2.rectangle(vis, (x, y), (x + w, y + h), color, 2)
             cx, cy = int(t["centroid"][0]), int(t["centroid"][1])
+            color = (0, 255, 0) if i == 0 else (0, 0, 255)
             cv2.circle(vis, (cx, cy), 5, color, -1)
-            bx, by = t["bottom_center"]
-            cv2.circle(vis, (bx, by), 5, (255, 255, 0), -1)
     else:
         cv2.putText(vis, "NO TRUNKS DETECTED", (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
