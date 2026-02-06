@@ -328,6 +328,118 @@ def align_frame_by_trunks(frame: np.ndarray, M: np.ndarray,
                           flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
 
 
+def align_sequential(prev_gray: np.ndarray, curr_frame: np.ndarray,
+                     detector, center_mask: np.ndarray,
+                     flann: cv2.FlannBasedMatcher | None = None) -> tuple[np.ndarray | None, np.ndarray]:
+    """Align curr_frame to prev_gray using SIFT features in the center region,
+    refined with ECC (Enhanced Correlation Coefficient) optimization.
+
+    Returns (affine_matrix_or_None, curr_gray).
+    """
+    curr_gray = cv2.cvtColor(curr_frame, cv2.COLOR_BGR2GRAY)
+    kp1, desc1 = detector.detectAndCompute(prev_gray, center_mask)
+    kp2, desc2 = detector.detectAndCompute(curr_gray, center_mask)
+
+    if desc1 is None or desc2 is None or len(kp1) < 10 or len(kp2) < 10:
+        return _ecc_fallback(prev_gray, curr_gray, center_mask)
+
+    if flann is not None:
+        matches = flann.knnMatch(desc2, desc1, k=2)
+    else:
+        matcher = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
+        matches = matcher.knnMatch(desc2, desc1, k=2)
+
+    good = []
+    for m_n in matches:
+        if len(m_n) == 2:
+            m, n = m_n
+            if m.distance < 0.7 * n.distance:
+                good.append(m)
+
+    if len(good) < 8:
+        return _ecc_fallback(prev_gray, curr_gray, center_mask)
+
+    src_pts = np.float32([kp2[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+    dst_pts = np.float32([kp1[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+
+    M, _ = cv2.estimateAffinePartial2D(src_pts, dst_pts, method=cv2.RANSAC,
+                                        ransacReprojThreshold=3.0)
+    if M is None:
+        return _ecc_fallback(prev_gray, curr_gray, center_mask)
+
+    # Reject if transform is too large
+    scale = np.sqrt(M[0, 0] ** 2 + M[0, 1] ** 2)
+    tx, ty = M[0, 2], M[1, 2]
+    if abs(scale - 1.0) > 0.15 or abs(tx) > 80 or abs(ty) > 80:
+        return _ecc_fallback(prev_gray, curr_gray, center_mask)
+
+    # Refine with ECC using the SIFT result as initial guess
+    M_refined = _ecc_refine(prev_gray, curr_gray, M, center_mask)
+    if M_refined is not None:
+        M = M_refined
+
+    return M, curr_gray
+
+
+def _ecc_fallback(prev_gray: np.ndarray, curr_gray: np.ndarray,
+                  center_mask: np.ndarray) -> tuple[np.ndarray | None, np.ndarray]:
+    """Try ECC alignment when feature matching fails."""
+    M = np.eye(2, 3, dtype=np.float64)
+    M_result = _ecc_refine(prev_gray, curr_gray, M, center_mask)
+    return M_result, curr_gray
+
+
+def _ecc_refine(prev_gray: np.ndarray, curr_gray: np.ndarray,
+                init_warp: np.ndarray, center_mask: np.ndarray) -> np.ndarray | None:
+    """Refine alignment using ECC (Enhanced Correlation Coefficient).
+
+    Works on downscaled images for speed, using the center region.
+    """
+    # Downscale for speed
+    scale = 0.5
+    h, w = prev_gray.shape
+    small_prev = cv2.resize(prev_gray, (int(w * scale), int(h * scale)))
+    small_curr = cv2.resize(curr_gray, (int(w * scale), int(h * scale)))
+    small_mask = cv2.resize(center_mask, (int(w * scale), int(h * scale)),
+                            interpolation=cv2.INTER_NEAREST)
+
+    # Scale the initial warp translation
+    warp = init_warp.copy().astype(np.float32)
+    warp[0, 2] *= scale
+    warp[1, 2] *= scale
+
+    criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 50, 1e-4)
+    try:
+        _, warp = cv2.findTransformECC(small_prev, small_curr, warp,
+                                        cv2.MOTION_EUCLIDEAN, criteria,
+                                        small_mask, 5)
+        # Scale translation back
+        warp[0, 2] /= scale
+        warp[1, 2] /= scale
+
+        # Sanity check
+        s = np.sqrt(warp[0, 0] ** 2 + warp[0, 1] ** 2)
+        tx, ty = warp[0, 2], warp[1, 2]
+        if abs(s - 1.0) > 0.15 or abs(tx) > 80 or abs(ty) > 80:
+            return None
+        return warp.astype(np.float64)
+    except cv2.error:
+        return None
+
+
+def make_center_mask(width: int, height: int) -> np.ndarray:
+    """Create a mask that covers the center foreground region, excluding
+    the left/right edges (big trunks) and upper sky area."""
+    mask = np.zeros((height, width), dtype=np.uint8)
+    # Use the middle 60% horizontally, lower 70% vertically
+    x1 = int(width * 0.20)
+    x2 = int(width * 0.80)
+    y1 = int(height * 0.30)
+    y2 = height
+    mask[y1:y2, x1:x2] = 255
+    return mask
+
+
 def crop_around_trunks(img: Image.Image, trunks: list[dict]) -> Image.Image:
     """Crop image so the two trunks are centered in the frame at WIDTHxHEIGHT."""
     orig_w, orig_h = img.size
@@ -533,6 +645,7 @@ def main():
     parser.add_argument("--no-align", action="store_true", help="Disable feature-based image alignment")
     parser.add_argument("--tree-detect", action="store_true", help="Detect two tree trunks for alignment and filtering")
     parser.add_argument("--tree-debug", action="store_true", help="Save debug images showing detected trunks")
+    parser.add_argument("--limit", type=int, default=0, help="Limit number of photos to process (0 = all)")
     args = parser.parse_args()
 
     # Check ffmpeg
@@ -552,6 +665,10 @@ def main():
         print("No photos found.")
         sys.exit(1)
 
+    if args.limit > 0:
+        photos = photos[:args.limit]
+        print(f"Limited to first {len(photos)} photos")
+
     print(f"Found {len(photos)} photos from {photos[0][0].strftime('%Y-%m-%d')} to {photos[-1][0].strftime('%Y-%m-%d')}")
     duration = len(photos) / args.fps
     print(f"Output: {duration:.1f}s at {args.fps}fps")
@@ -563,21 +680,76 @@ def main():
 
     if tree_mode:
         print("Setting up tree-trunk detection...")
-        result = pick_reference_with_trunks(photos)
-        if result is None:
-            print("Error: Could not find a reference frame with two detectable trunks.")
-            print("Try running without --tree-detect or check your photos.")
-            sys.exit(1)
-        ref_cv, ref_trunks = result
-        ref_gray = cv2.cvtColor(ref_cv, cv2.COLOR_BGR2GRAY)
-        detector = cv2.ORB_create(nfeatures=3000)
-        ref_kp, ref_desc = detector.detectAndCompute(ref_gray, None)
-        tree_discards = 0
-        tree_align_failures = 0
+        detector = cv2.SIFT_create(nfeatures=3000)
+        flann_index = dict(algorithm=1, trees=5)  # FLANN_INDEX_KDTREE
+        flann_search = dict(checks=50)
+        flann = cv2.FlannBasedMatcher(flann_index, flann_search)
+        center_mask = make_center_mask(WIDTH, HEIGHT)
         if args.tree_debug:
             debug_dir = os.path.join(os.path.dirname(args.output) or ".", "tree_debug")
             os.makedirs(debug_dir, exist_ok=True)
             print(f"  Debug images will be saved to {debug_dir}/")
+
+        # Pass 1: detect trunks in all photos
+        print("Pass 1: Detecting trunks...")
+        trunk_data = []  # (index, date, path, trunks)
+        tree_discards = 0
+        for i, (date, path) in enumerate(photos):
+            try:
+                img = Image.open(path).convert("RGB")
+                try:
+                    from PIL import ImageOps
+                    img = ImageOps.exif_transpose(img)
+                except Exception:
+                    pass
+                cv_img = pil_to_cv(img)
+                trunks = detect_trunks(cv_img)
+
+                if args.tree_debug:
+                    debug_draw_trunks(cv_img, trunks, path, debug_dir)
+
+                if trunks is None:
+                    tree_discards += 1
+                else:
+                    trunk_data.append((i, date, path, trunks))
+            except Exception as e:
+                print(f"  Skipping {path}: {e}")
+                tree_discards += 1
+
+            if (i + 1) % 100 == 0 or i == len(photos) - 1:
+                print(f"  {i + 1}/{len(photos)}")
+
+        print(f"  Kept {len(trunk_data)}, discarded {tree_discards}")
+
+        if not trunk_data:
+            print("Error: No photos with detectable trunks.")
+            sys.exit(1)
+
+        # Smooth trunk positions with a rolling window
+        smooth_window = max(5, len(trunk_data) // 50)
+        if smooth_window % 2 == 0:
+            smooth_window += 1
+        left_edges = np.array([t[3][0]["inner_edge"] for t in trunk_data], dtype=np.float64)
+        right_edges = np.array([t[3][1]["inner_edge"] for t in trunk_data], dtype=np.float64)
+        kernel = np.ones(smooth_window) / smooth_window
+        left_smooth = np.convolve(left_edges, kernel, mode="same")
+        right_smooth = np.convolve(right_edges, kernel, mode="same")
+        # Fix edges of convolution
+        half = smooth_window // 2
+        for j in range(half):
+            w = j + half + 1
+            left_smooth[j] = np.mean(left_edges[:w])
+            right_smooth[j] = np.mean(right_edges[:w])
+            left_smooth[-(j + 1)] = np.mean(left_edges[-w:])
+            right_smooth[-(j + 1)] = np.mean(right_edges[-w:])
+
+        print(f"  Smoothed trunk positions (window={smooth_window})")
+
+        # Pass 2: crop and render using smoothed positions + sequential alignment
+        print("Pass 2: Rendering frames...")
+        seq_align_ok = 0
+        seq_align_fail = 0
+        prev_gray = None
     elif align:
         print("Setting up alignment (using middle photo as reference)...")
         ref_cv = pick_reference(photos)
@@ -589,48 +761,85 @@ def main():
     # Process frames into temp directory
     frame_count = 0
     with tempfile.TemporaryDirectory() as tmpdir:
-        print("Processing frames...")
-        for i, (date, path) in enumerate(photos):
-            try:
-                img = Image.open(path).convert("RGB")
+        if tree_mode:
+            # Accumulated transform for sequential alignment
+            cum_tx, cum_ty = 0.0, 0.0
+            damping = 0.95  # slight drift correction toward center
+
+            # Collect all cropped/aligned frames and dates into arrays
+            raw_frames = []  # list of (cv_frame, date)
+
+            for j, (orig_i, date, path, trunks) in enumerate(trunk_data):
                 try:
-                    from PIL import ImageOps
-                    img = ImageOps.exif_transpose(img)
-                except Exception:
-                    pass
+                    img = Image.open(path).convert("RGB")
+                    try:
+                        from PIL import ImageOps
+                        img = ImageOps.exif_transpose(img)
+                    except Exception:
+                        pass
 
-                if tree_mode:
-                    cv_img = pil_to_cv(img)
-                    trunks = detect_trunks(cv_img)
+                    # Build smoothed trunks for cropping
+                    smooth_trunks = [
+                        {**trunks[0], "inner_edge": int(left_smooth[j]),
+                         "centroid": (left_smooth[j] / 2, WORK_HEIGHT / 2),
+                         "bottom_center": (left_smooth[j] / 2, WORK_HEIGHT)},
+                        {**trunks[1], "inner_edge": int(right_smooth[j]),
+                         "centroid": ((right_smooth[j] + WORK_WIDTH) / 2, WORK_HEIGHT / 2),
+                         "bottom_center": ((right_smooth[j] + WORK_WIDTH) / 2, WORK_HEIGHT)},
+                    ]
 
-                    if args.tree_debug:
-                        debug_draw_trunks(cv_img, trunks, path,
-                                          debug_dir)
-
-                    if trunks is None:
-                        tree_discards += 1
-                        continue
-
-                    img = crop_around_trunks(img, trunks)
+                    img = crop_around_trunks(img, smooth_trunks)
                     frame_cv = pil_to_cv(img)
-                    frame_trunks = detect_trunks(frame_cv)
 
-                    if frame_trunks is not None:
-                        M = compute_trunk_alignment(frame_trunks, ref_trunks,
-                                                    (HEIGHT, WIDTH))
+                    # Sequential alignment to previous frame
+                    if prev_gray is not None:
+                        M, curr_gray = align_sequential(prev_gray, frame_cv,
+                                                        detector, center_mask,
+                                                        flann)
                         if M is not None:
-                            aligned = align_frame_by_trunks(frame_cv, M)
-                            img = cv_to_pil(aligned)
+                            cum_tx = cum_tx * damping + M[0, 2]
+                            cum_ty = cum_ty * damping + M[1, 2]
+                            M_cum = np.float64([[1, 0, cum_tx], [0, 1, cum_ty]])
+                            frame_cv = cv2.warpAffine(frame_cv, M_cum,
+                                                      (WIDTH, HEIGHT),
+                                                      borderMode=cv2.BORDER_REFLECT)
+                            seq_align_ok += 1
                         else:
-                            tree_align_failures += 1
+                            seq_align_fail += 1
+                        prev_gray = cv2.cvtColor(frame_cv, cv2.COLOR_BGR2GRAY)
                     else:
-                        tree_align_failures += 1
-                        # Fall back to ORB alignment
-                        aligned = align_to_reference(frame_cv, ref_gray,
-                                                     ref_kp, ref_desc, detector)
-                        if aligned is not None:
-                            img = cv_to_pil(aligned)
-                else:
+                        prev_gray = cv2.cvtColor(frame_cv, cv2.COLOR_BGR2GRAY)
+
+                    raw_frames.append((frame_cv, date))
+                except Exception as e:
+                    print(f"  Skipping {path}: {e}")
+                    continue
+
+                if (j + 1) % 50 == 0 or j == len(trunk_data) - 1:
+                    print(f"  {j + 1}/{len(trunk_data)}")
+
+            print(f"  Discarded {tree_discards}/{len(photos)} photos (no trunks detected)")
+            print(f"  Sequential alignment: {seq_align_ok} OK, {seq_align_fail} failed")
+
+            # Write frames
+            for frame_cv, date in raw_frames:
+                img = cv_to_pil(frame_cv)
+                if not args.no_date:
+                    img = add_date_overlay(img, date)
+                frame_path = os.path.join(tmpdir, f"frame_{frame_count:06d}.jpg")
+                img.save(frame_path, "JPEG", quality=95)
+                frame_count += 1
+        else:
+            print("Processing frames...")
+            for i, (date, path) in enumerate(photos):
+                try:
+                    img = Image.open(path).convert("RGB")
+                    try:
+                        from PIL import ImageOps
+                        img = ImageOps.exif_transpose(img)
+                    except Exception:
+                        pass
+
                     img = resize_and_crop(img)
                     if align:
                         frame_cv = pil_to_cv(img)
@@ -641,24 +850,20 @@ def main():
                         else:
                             img = cv_to_pil(aligned)
 
-                if not args.no_date:
-                    img = add_date_overlay(img, date)
-                frame_path = os.path.join(tmpdir, f"frame_{frame_count:06d}.jpg")
-                img.save(frame_path, "JPEG", quality=95)
-                frame_count += 1
-            except Exception as e:
-                print(f"  Skipping {path}: {e}")
-                continue
+                    if not args.no_date:
+                        img = add_date_overlay(img, date)
+                    frame_path = os.path.join(tmpdir, f"frame_{frame_count:06d}.jpg")
+                    img.save(frame_path, "JPEG", quality=95)
+                    frame_count += 1
+                except Exception as e:
+                    print(f"  Skipping {path}: {e}")
+                    continue
 
-            if (i + 1) % 50 == 0 or i == len(photos) - 1:
-                print(f"  {i + 1}/{len(photos)}")
+                if (i + 1) % 50 == 0 or i == len(photos) - 1:
+                    print(f"  {i + 1}/{len(photos)}")
 
-        if tree_mode:
-            print(f"  Discarded {tree_discards}/{len(photos)} photos (no trunks detected)")
-            if tree_align_failures:
-                print(f"  Trunk alignment failed on {tree_align_failures} frames (used fallback)")
-        elif align and align_failures:
-            print(f"  Alignment failed on {align_failures}/{len(photos)} frames (used unaligned)")
+            if align and align_failures:
+                print(f"  Alignment failed on {align_failures}/{len(photos)} frames (used unaligned)")
 
         # Stitch with ffmpeg
         print("Encoding video...")
