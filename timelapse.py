@@ -958,27 +958,6 @@ def main():
             ref_img = ImageOps.exif_transpose(ref_img)
         except Exception:
             pass
-        ref_smooth_trunks = [
-            {**ref_entry[3][0], "inner_edge": int(left_smooth[ref_idx]),
-             "centroid": (left_smooth[ref_idx] / 2, WORK_HEIGHT / 2),
-             "bottom_center": (left_smooth[ref_idx] / 2, WORK_HEIGHT)},
-            {**ref_entry[3][1], "inner_edge": int(right_smooth[ref_idx]),
-             "centroid": ((right_smooth[ref_idx] + WORK_WIDTH) / 2, WORK_HEIGHT / 2),
-             "bottom_center": ((right_smooth[ref_idx] + WORK_WIDTH) / 2, WORK_HEIGHT)},
-        ]
-        ref_wall_y = wall_smooth[ref_idx] if use_wall else None
-        ref_img = crop_around_trunks(ref_img, ref_smooth_trunks, ref_wall_y)
-        ref_gray = cv2.cvtColor(pil_to_cv(ref_img), cv2.COLOR_BGR2GRAY)
-        print(f"  Alignment reference: {os.path.basename(ref_entry[2])}")
-
-        # Pass 2: rough crop, sequential alignment, accumulate offsets
-        print("Pass 2: Finding alignment offsets (sequential)...")
-        align_ok = 0
-        align_fail = 0
-        prev_crop_gray = ref_gray  # start chain from reference
-        cum_ox, cum_oy = 0.0, 0.0
-        # Store (crop_box, offset_x, offset_y, date, path) per frame
-        offset_data = []
     elif align:
         print("Setting up alignment (using middle photo as reference)...")
         ref_cv = pick_reference(photos)
@@ -991,7 +970,8 @@ def main():
     frame_count = 0
     with tempfile.TemporaryDirectory() as tmpdir:
         if tree_mode:
-            # Pass 2: rough crop each frame, match to previous frame
+            # Pass 2: crop each frame using smoothed trunk + wall positions
+            print("Pass 2: Rendering frames (landmark-locked crops)...")
             for j, (orig_i, date, path, trunks, _wall_y_raw) in enumerate(trunk_data):
                 try:
                     img = Image.open(path).convert("RGB")
@@ -1012,65 +992,7 @@ def main():
 
                     frame_wall_y = wall_smooth[j] if use_wall else None
                     crop_box = compute_crop_box(img.size, smooth_trunks, frame_wall_y)
-                    rough_crop = apply_crop(img, *crop_box)
-                    frame_cv = pil_to_cv(rough_crop)
-                    curr_gray = cv2.cvtColor(frame_cv, cv2.COLOR_BGR2GRAY)
-
-                    # Match to previous frame (sequential)
-                    M, _ = align_sequential(prev_crop_gray, frame_cv,
-                                            detector, center_mask, flann,
-                                            lg_extractor, lg_matcher)
-                    if M is not None:
-                        # Accumulate the per-frame offset in original coords
-                        scale_x = crop_box[2] / WIDTH
-                        scale_y = crop_box[3] / HEIGHT
-                        cum_ox += -M[0, 2] * scale_x
-                        cum_oy += -M[1, 2] * scale_y
-                        align_ok += 1
-                    else:
-                        align_fail += 1
-
-                    offset_data.append((crop_box, cum_ox, cum_oy, date, path))
-                    prev_crop_gray = curr_gray
-                except Exception as e:
-                    print(f"  Skipping {path}: {e}")
-                    continue
-
-                if (j + 1) % 50 == 0 or j == len(trunk_data) - 1:
-                    print(f"  {j + 1}/{len(trunk_data)}")
-
-            print(f"  Discarded {tree_discards}/{len(photos)} photos (no trunks detected)")
-            print(f"  Sequential alignment: {align_ok} OK, {align_fail} failed")
-
-            # Smooth the offsets
-            if offset_data:
-                ox_raw = np.array([d[1] for d in offset_data])
-                oy_raw = np.array([d[2] for d in offset_data])
-                t_kernel = np.ones(smooth_window) / smooth_window
-                ox_smooth = np.convolve(ox_raw, t_kernel, mode="same")
-                oy_smooth = np.convolve(oy_raw, t_kernel, mode="same")
-                for k in range(half):
-                    w = k + half + 1
-                    ox_smooth[k] = np.mean(ox_raw[:w])
-                    oy_smooth[k] = np.mean(oy_raw[:w])
-                    ox_smooth[-(k + 1)] = np.mean(ox_raw[-w:])
-                    oy_smooth[-(k + 1)] = np.mean(oy_raw[-w:])
-                print(f"  Smoothed crop offsets (window={smooth_window})")
-
-            # Pass 3: re-crop with smoothed offsets baked in — no warping
-            print("Pass 3: Rendering with corrected crops...")
-            for j, (crop_box, _, _, date, path) in enumerate(offset_data):
-                try:
-                    img = Image.open(path).convert("RGB")
-                    try:
-                        from PIL import ImageOps
-                        img = ImageOps.exif_transpose(img)
-                    except Exception:
-                        pass
-
-                    img = apply_crop(img, crop_box[0], crop_box[1],
-                                     crop_box[2], crop_box[3],
-                                     ox_smooth[j], oy_smooth[j])
+                    img = apply_crop(img, *crop_box)
 
                     if not args.no_date:
                         img = add_date_overlay(img, date)
@@ -1080,6 +1002,11 @@ def main():
                 except Exception as e:
                     print(f"  Skipping {path}: {e}")
                     continue
+
+                if (j + 1) % 100 == 0 or j == len(trunk_data) - 1:
+                    print(f"  {j + 1}/{len(trunk_data)}")
+
+            print(f"  Discarded {tree_discards}/{len(photos)} photos (no trunks detected)")
         else:
             print("Processing frames...")
             for i, (date, path) in enumerate(photos):
