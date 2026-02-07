@@ -8,6 +8,10 @@ Usage:
 
 Requires: Pillow, opencv-python, numpy, ffmpeg (must be on PATH)
     pip install Pillow opencv-python numpy
+
+Optional (for deep-learning alignment):
+    pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+    pip install git+https://github.com/cvg/LightGlue.git
 """
 
 import argparse
@@ -30,6 +34,18 @@ try:
 except ImportError:
     print("OpenCV and NumPy are required: pip install opencv-python numpy")
     sys.exit(1)
+
+# Optional deep-learning matcher
+try:
+    import torch
+    from lightglue import LightGlue, SuperPoint
+    from lightglue.utils import rbd
+    HAS_LIGHTGLUE = True
+    # Use GPU if available (ROCm for AMD, CUDA for NVIDIA)
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+except ImportError:
+    HAS_LIGHTGLUE = False
+    DEVICE = None
 
 
 WIDTH = 1920
@@ -246,10 +262,10 @@ def detect_trunks(image: np.ndarray) -> list[dict] | None:
 
     # Validate the pattern
     # Left edge (inner edge of left trunk) should be in left portion
-    if left_edge < WORK_WIDTH * 0.05 or left_edge > WORK_WIDTH * 0.45:
+    if left_edge > WORK_WIDTH * 0.45:
         return None
     # Right edge (inner edge of right trunk) should be in right portion
-    if right_edge < WORK_WIDTH * 0.55 or right_edge > WORK_WIDTH * 0.95:
+    if right_edge < WORK_WIDTH * 0.55:
         return None
     # Must have a meaningful gap between the trunks
     if (right_edge - left_edge) < WORK_WIDTH * 0.2:
@@ -278,6 +294,47 @@ def detect_trunks(image: np.ndarray) -> list[dict] | None:
     }
 
     return [left_trunk, right_trunk]
+
+
+def detect_wall_y(image: np.ndarray) -> float | None:
+    """Detect the horizontal wall position using Sobel edge detection.
+
+    Looks for the strongest horizontal edge in the center strip (between trunks)
+    in the y=180-350 range of the 960x540 working resolution.
+
+    Returns wall y-position in WORK_HEIGHT coords, or None if not found.
+    """
+    work = cv2.resize(image, (WORK_WIDTH, WORK_HEIGHT))
+    gray = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
+
+    # Center strip between trunks
+    x1 = int(WORK_WIDTH * 0.25)
+    x2 = int(WORK_WIDTH * 0.75)
+    center = gray[:, x1:x2]
+
+    # Horizontal edge detection
+    sobel_y = cv2.Sobel(center, cv2.CV_64F, 0, 1, ksize=5)
+    edge_profile = np.mean(np.abs(sobel_y), axis=1)
+
+    # Smooth to avoid noise spikes
+    kernel = np.ones(11) / 11
+    edge_smooth = np.convolve(edge_profile, kernel, mode="same")
+
+    # Search in the expected wall region
+    search_start = int(WORK_HEIGHT * 0.33)
+    search_end = int(WORK_HEIGHT * 0.65)
+    if search_end <= search_start:
+        return None
+
+    region = edge_smooth[search_start:search_end]
+    best_y = search_start + np.argmax(region)
+    strength = edge_smooth[best_y]
+
+    # Reject if edge is too weak (no wall visible)
+    if strength < 800:
+        return None
+
+    return float(best_y)
 
 
 def compute_trunk_alignment(trunks: list[dict], ref_trunks: list[dict],
@@ -330,13 +387,28 @@ def align_frame_by_trunks(frame: np.ndarray, M: np.ndarray,
 
 def align_sequential(prev_gray: np.ndarray, curr_frame: np.ndarray,
                      detector, center_mask: np.ndarray,
-                     flann: cv2.FlannBasedMatcher | None = None) -> tuple[np.ndarray | None, np.ndarray]:
-    """Align curr_frame to prev_gray using SIFT features in the center region,
+                     flann: cv2.FlannBasedMatcher | None = None,
+                     lg_extractor=None, lg_matcher=None) -> tuple[np.ndarray | None, np.ndarray]:
+    """Align curr_frame to prev_gray using feature matching in the center region,
     refined with ECC (Enhanced Correlation Coefficient) optimization.
 
+    Uses LightGlue (deep learning) if available, falls back to SIFT+FLANN.
     Returns (affine_matrix_or_None, curr_gray).
     """
     curr_gray = cv2.cvtColor(curr_frame, cv2.COLOR_BGR2GRAY)
+
+    # Try LightGlue first (much better cross-season matching)
+    if lg_extractor is not None and lg_matcher is not None:
+        M = _lightglue_match(prev_gray, curr_gray, lg_extractor, lg_matcher,
+                             center_mask)
+        if M is not None:
+            # Refine with ECC
+            M_refined = _ecc_refine(prev_gray, curr_gray, M, center_mask)
+            if M_refined is not None:
+                M = M_refined
+            return M, curr_gray
+
+    # Fall back to SIFT + FLANN
     kp1, desc1 = detector.detectAndCompute(prev_gray, center_mask)
     kp2, desc2 = detector.detectAndCompute(curr_gray, center_mask)
 
@@ -427,15 +499,71 @@ def _ecc_refine(prev_gray: np.ndarray, curr_gray: np.ndarray,
         return None
 
 
+def _lightglue_match(prev_gray: np.ndarray, curr_gray: np.ndarray,
+                     lg_extractor, lg_matcher,
+                     center_mask: np.ndarray) -> np.ndarray | None:
+    """Match features using SuperPoint + LightGlue (deep learning).
+
+    Returns affine matrix or None. Uses center_mask to filter matches.
+    """
+    h, w = prev_gray.shape
+
+    # LightGlue expects float32 tensor in [0, 1], shape (1, 1, H, W)
+    t_prev = torch.from_numpy(prev_gray).float()[None, None].to(DEVICE) / 255.0
+    t_curr = torch.from_numpy(curr_gray).float()[None, None].to(DEVICE) / 255.0
+
+    with torch.no_grad():
+        feats0 = lg_extractor.extract(t_prev)
+        feats1 = lg_extractor.extract(t_curr)
+        matches01 = lg_matcher({"image0": feats0, "image1": feats1})
+        feats0, feats1, matches01 = [rbd(x) for x in [feats0, feats1, matches01]]
+
+    kpts0 = feats0["keypoints"].cpu().numpy()
+    kpts1 = feats1["keypoints"].cpu().numpy()
+    match_indices = matches01["matches"].cpu().numpy()
+
+    # Filter: only use matches where both points are in center mask
+    good_src = []
+    good_dst = []
+    for idx0, idx1 in match_indices:
+        pt0 = kpts0[idx0]
+        pt1 = kpts1[idx1]
+        # Check both points are in the mask region
+        y0, x0 = int(pt0[1]), int(pt0[0])
+        y1, x1_coord = int(pt1[1]), int(pt1[0])
+        if (0 <= y0 < h and 0 <= x0 < w and center_mask[y0, x0] > 0 and
+                0 <= y1 < h and 0 <= x1_coord < w and center_mask[y1, x1_coord] > 0):
+            good_dst.append(pt0)  # prev = destination
+            good_src.append(pt1)  # curr = source
+
+    if len(good_src) < 8:
+        return None
+
+    src_pts = np.float32(good_src).reshape(-1, 1, 2)
+    dst_pts = np.float32(good_dst).reshape(-1, 1, 2)
+
+    M, inliers = cv2.estimateAffinePartial2D(src_pts, dst_pts, method=cv2.RANSAC,
+                                              ransacReprojThreshold=3.0)
+    if M is None:
+        return None
+
+    scale = np.sqrt(M[0, 0] ** 2 + M[0, 1] ** 2)
+    tx, ty = M[0, 2], M[1, 2]
+    if abs(scale - 1.0) > 0.15 or abs(tx) > 80 or abs(ty) > 80:
+        return None
+
+    return M
+
+
 def make_center_mask(width: int, height: int) -> np.ndarray:
-    """Create a mask that covers the center foreground region, excluding
-    the left/right edges (big trunks) and upper sky area."""
+    """Create a mask focused on the foreground trees and stone wall,
+    excluding big trunks, sky, and bare ground."""
     mask = np.zeros((height, width), dtype=np.uint8)
-    # Use the middle 60% horizontally, lower 70% vertically
-    x1 = int(width * 0.20)
-    x2 = int(width * 0.80)
+    # Focus on center where small trees and stone wall are
+    x1 = int(width * 0.25)
+    x2 = int(width * 0.75)
     y1 = int(height * 0.30)
-    y2 = height
+    y2 = int(height * 0.75)
     mask[y1:y2, x1:x2] = 255
     return mask
 
@@ -443,11 +571,13 @@ def make_center_mask(width: int, height: int) -> np.ndarray:
 # Target positions for trunk inner edges in output frame (fraction of WIDTH)
 TARGET_LEFT_EDGE = 0.15   # left trunk inner edge at 15% from left
 TARGET_RIGHT_EDGE = 0.85  # right trunk inner edge at 85% from left
+TARGET_WALL_Y = 0.45      # wall at 45% down from top of output frame
 
 
 def compute_crop_box(img_size: tuple[int, int],
-                     trunks: list[dict]) -> tuple[float, float, float, float]:
-    """Compute crop box that locks trunk inner edges to fixed output positions.
+                     trunks: list[dict],
+                     wall_y: float | None = None) -> tuple[float, float, float, float]:
+    """Compute crop box that locks trunk inner edges and wall to fixed output positions.
 
     Returns (left, top, crop_w, crop_h) in original image coords.
     """
@@ -484,8 +614,12 @@ def compute_crop_box(img_size: tuple[int, int],
     scale = crop_w / WIDTH
     left = left_edge_orig - TARGET_LEFT_EDGE * crop_w
 
-    # Vertical: center the crop vertically on the image
-    top = (orig_h - crop_h) / 2
+    # Vertical: anchor on wall if detected, otherwise center
+    if wall_y is not None:
+        wall_y_orig = wall_y * sy
+        top = wall_y_orig - TARGET_WALL_Y * crop_h
+    else:
+        top = (orig_h - crop_h) / 2
 
     left = max(0, min(left, orig_w - crop_w))
     top = max(0, min(top, orig_h - crop_h))
@@ -507,9 +641,10 @@ def apply_crop(img: Image.Image, left: float, top: float,
     return img
 
 
-def crop_around_trunks(img: Image.Image, trunks: list[dict]) -> Image.Image:
+def crop_around_trunks(img: Image.Image, trunks: list[dict],
+                       wall_y: float | None = None) -> Image.Image:
     """Crop image so the two trunks are centered in the frame at WIDTHxHEIGHT."""
-    left, top, crop_w, crop_h = compute_crop_box(img.size, trunks)
+    left, top, crop_w, crop_h = compute_crop_box(img.size, trunks, wall_y)
     return apply_crop(img, left, top, crop_w, crop_h)
 
 
@@ -677,7 +812,7 @@ def main():
     parser.add_argument("--fps", type=int, default=10, help="Frames per second (default: 10)")
     parser.add_argument("--no-date", action="store_true", help="Disable date overlay")
     parser.add_argument("--no-gps-filter", action="store_true", help="Disable GPS location filtering")
-    parser.add_argument("--gps-radius", type=int, default=50, help="GPS filter radius in meters (default: 50)")
+    parser.add_argument("--gps-radius", type=int, default=30, help="GPS filter radius in meters (default: 30)")
     parser.add_argument("--no-align", action="store_true", help="Disable feature-based image alignment")
     parser.add_argument("--tree-detect", action="store_true", help="Detect two tree trunks for alignment and filtering")
     parser.add_argument("--tree-debug", action="store_true", help="Save debug images showing detected trunks")
@@ -721,6 +856,17 @@ def main():
         flann_search = dict(checks=50)
         flann = cv2.FlannBasedMatcher(flann_index, flann_search)
         center_mask = make_center_mask(WIDTH, HEIGHT)
+
+        # Initialize LightGlue if available
+        lg_extractor = None
+        lg_matcher = None
+        if HAS_LIGHTGLUE:
+            device_name = "GPU" if DEVICE.type == "cuda" else "CPU"
+            print(f"  LightGlue available — using deep learning alignment ({device_name})")
+            lg_extractor = SuperPoint(max_num_keypoints=2048).eval().to(DEVICE)
+            lg_matcher = LightGlue(features="superpoint").eval().to(DEVICE)
+        else:
+            print("  LightGlue not available — using SIFT+FLANN")
         if args.tree_debug:
             debug_dir = os.path.join(os.path.dirname(args.output) or ".", "tree_debug")
             os.makedirs(debug_dir, exist_ok=True)
@@ -747,7 +893,8 @@ def main():
                 if trunks is None:
                     tree_discards += 1
                 else:
-                    trunk_data.append((i, date, path, trunks))
+                    wall_y = detect_wall_y(cv_img)
+                    trunk_data.append((i, date, path, trunks, wall_y))
             except Exception as e:
                 print(f"  Skipping {path}: {e}")
                 tree_discards += 1
@@ -761,15 +908,33 @@ def main():
             print("Error: No photos with detectable trunks.")
             sys.exit(1)
 
-        # Smooth trunk positions with a large rolling window
+        # Smooth trunk positions and wall y with a large rolling window
         smooth_window = max(7, len(trunk_data) // 10)
         if smooth_window % 2 == 0:
             smooth_window += 1
         left_edges = np.array([t[3][0]["inner_edge"] for t in trunk_data], dtype=np.float64)
         right_edges = np.array([t[3][1]["inner_edge"] for t in trunk_data], dtype=np.float64)
+
+        # Wall y: fill missing detections with interpolation
+        raw_wall_y = [t[4] for t in trunk_data]
+        wall_detected = sum(1 for w in raw_wall_y if w is not None)
+        if wall_detected > len(trunk_data) * 0.5:
+            # Enough wall detections — interpolate missing values
+            median_wall = np.median([w for w in raw_wall_y if w is not None])
+            wall_y_arr = np.array([w if w is not None else median_wall for w in raw_wall_y],
+                                  dtype=np.float64)
+            use_wall = True
+            print(f"  Wall detected in {wall_detected}/{len(trunk_data)} frames")
+        else:
+            wall_y_arr = None
+            use_wall = False
+            print(f"  Wall detected in only {wall_detected}/{len(trunk_data)} frames — not using")
+
         kernel = np.ones(smooth_window) / smooth_window
         left_smooth = np.convolve(left_edges, kernel, mode="same")
         right_smooth = np.convolve(right_edges, kernel, mode="same")
+        if use_wall:
+            wall_smooth = np.convolve(wall_y_arr, kernel, mode="same")
         # Fix edges of convolution
         half = smooth_window // 2
         for j in range(half):
@@ -778,8 +943,11 @@ def main():
             right_smooth[j] = np.mean(right_edges[:w])
             left_smooth[-(j + 1)] = np.mean(left_edges[-w:])
             right_smooth[-(j + 1)] = np.mean(right_edges[-w:])
+            if use_wall:
+                wall_smooth[j] = np.mean(wall_y_arr[:w])
+                wall_smooth[-(j + 1)] = np.mean(wall_y_arr[-w:])
 
-        print(f"  Smoothed trunk positions (window={smooth_window})")
+        print(f"  Smoothed positions (window={smooth_window})")
 
         # Pick a reference frame for alignment (use middle of kept frames)
         ref_idx = len(trunk_data) // 2
@@ -798,14 +966,17 @@ def main():
              "centroid": ((right_smooth[ref_idx] + WORK_WIDTH) / 2, WORK_HEIGHT / 2),
              "bottom_center": ((right_smooth[ref_idx] + WORK_WIDTH) / 2, WORK_HEIGHT)},
         ]
-        ref_img = crop_around_trunks(ref_img, ref_smooth_trunks)
+        ref_wall_y = wall_smooth[ref_idx] if use_wall else None
+        ref_img = crop_around_trunks(ref_img, ref_smooth_trunks, ref_wall_y)
         ref_gray = cv2.cvtColor(pil_to_cv(ref_img), cv2.COLOR_BGR2GRAY)
         print(f"  Alignment reference: {os.path.basename(ref_entry[2])}")
 
-        # Pass 2: rough crop, align to reference, collect offsets
-        print("Pass 2: Finding alignment offsets...")
+        # Pass 2: rough crop, sequential alignment, accumulate offsets
+        print("Pass 2: Finding alignment offsets (sequential)...")
         align_ok = 0
         align_fail = 0
+        prev_crop_gray = ref_gray  # start chain from reference
+        cum_ox, cum_oy = 0.0, 0.0
         # Store (crop_box, offset_x, offset_y, date, path) per frame
         offset_data = []
     elif align:
@@ -820,8 +991,8 @@ def main():
     frame_count = 0
     with tempfile.TemporaryDirectory() as tmpdir:
         if tree_mode:
-            # Pass 2: rough crop each frame, find offset to reference
-            for j, (orig_i, date, path, trunks) in enumerate(trunk_data):
+            # Pass 2: rough crop each frame, match to previous frame
+            for j, (orig_i, date, path, trunks, _wall_y_raw) in enumerate(trunk_data):
                 try:
                     img = Image.open(path).convert("RGB")
                     try:
@@ -839,26 +1010,28 @@ def main():
                          "bottom_center": ((right_smooth[j] + WORK_WIDTH) / 2, WORK_HEIGHT)},
                     ]
 
-                    crop_box = compute_crop_box(img.size, smooth_trunks)
+                    frame_wall_y = wall_smooth[j] if use_wall else None
+                    crop_box = compute_crop_box(img.size, smooth_trunks, frame_wall_y)
                     rough_crop = apply_crop(img, *crop_box)
                     frame_cv = pil_to_cv(rough_crop)
+                    curr_gray = cv2.cvtColor(frame_cv, cv2.COLOR_BGR2GRAY)
 
-                    # Find alignment offset to reference
-                    M, _ = align_sequential(ref_gray, frame_cv,
-                                            detector, center_mask, flann)
-                    ox, oy = 0.0, 0.0
+                    # Match to previous frame (sequential)
+                    M, _ = align_sequential(prev_crop_gray, frame_cv,
+                                            detector, center_mask, flann,
+                                            lg_extractor, lg_matcher)
                     if M is not None:
-                        # Convert pixel offset in output coords back to
-                        # original image coords (scale by crop_w/WIDTH)
+                        # Accumulate the per-frame offset in original coords
                         scale_x = crop_box[2] / WIDTH
                         scale_y = crop_box[3] / HEIGHT
-                        ox = -M[0, 2] * scale_x
-                        oy = -M[1, 2] * scale_y
+                        cum_ox += -M[0, 2] * scale_x
+                        cum_oy += -M[1, 2] * scale_y
                         align_ok += 1
                     else:
                         align_fail += 1
 
-                    offset_data.append((crop_box, ox, oy, date, path))
+                    offset_data.append((crop_box, cum_ox, cum_oy, date, path))
+                    prev_crop_gray = curr_gray
                 except Exception as e:
                     print(f"  Skipping {path}: {e}")
                     continue
@@ -867,7 +1040,7 @@ def main():
                     print(f"  {j + 1}/{len(trunk_data)}")
 
             print(f"  Discarded {tree_discards}/{len(photos)} photos (no trunks detected)")
-            print(f"  Reference alignment: {align_ok} OK, {align_fail} failed")
+            print(f"  Sequential alignment: {align_ok} OK, {align_fail} failed")
 
             # Smooth the offsets
             if offset_data:
