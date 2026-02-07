@@ -440,41 +440,77 @@ def make_center_mask(width: int, height: int) -> np.ndarray:
     return mask
 
 
-def crop_around_trunks(img: Image.Image, trunks: list[dict]) -> Image.Image:
-    """Crop image so the two trunks are centered in the frame at WIDTHxHEIGHT."""
-    orig_w, orig_h = img.size
+# Target positions for trunk inner edges in output frame (fraction of WIDTH)
+TARGET_LEFT_EDGE = 0.15   # left trunk inner edge at 15% from left
+TARGET_RIGHT_EDGE = 0.85  # right trunk inner edge at 85% from left
+
+
+def compute_crop_box(img_size: tuple[int, int],
+                     trunks: list[dict]) -> tuple[float, float, float, float]:
+    """Compute crop box that locks trunk inner edges to fixed output positions.
+
+    Returns (left, top, crop_w, crop_h) in original image coords.
+    """
+    orig_w, orig_h = img_size
     sx = orig_w / WORK_WIDTH
     sy = orig_h / WORK_HEIGHT
 
-    left_cx = trunks[0]["centroid"][0] * sx
-    right_cx = trunks[1]["centroid"][0] * sx
-    mid_x = (left_cx + right_cx) / 2
+    # Trunk inner edges in original image coords
+    left_edge_orig = trunks[0]["inner_edge"] * sx
+    right_edge_orig = trunks[1]["inner_edge"] * sx
+    trunk_span_orig = right_edge_orig - left_edge_orig
 
-    left_bot_y = trunks[0]["bottom_center"][1] * sy
-    right_bot_y = trunks[1]["bottom_center"][1] * sy
-    bottom_y = max(left_bot_y, right_bot_y)
+    # Target span in output pixels
+    target_span = (TARGET_RIGHT_EDGE - TARGET_LEFT_EDGE) * WIDTH
 
-    trunk_span = right_cx - left_cx
-    crop_w = trunk_span / 0.65
-    crop_h = crop_w * (HEIGHT / WIDTH)
+    # Scale: how many original pixels per output pixel
+    scale = trunk_span_orig / target_span
 
+    # Crop dimensions in original image coords
+    crop_w = WIDTH * scale
+    crop_h = HEIGHT * scale
+
+    # Clamp to image bounds
     crop_w = min(crop_w, orig_w)
     crop_h = min(crop_h, orig_h)
 
+    # Ensure aspect ratio
     if crop_w / crop_h > WIDTH / HEIGHT:
         crop_h = crop_w * (HEIGHT / WIDTH)
     else:
         crop_w = crop_h * (WIDTH / HEIGHT)
 
-    left = mid_x - crop_w / 2
-    top = bottom_y - crop_h * 0.85
+    # Position: left trunk inner edge should map to TARGET_LEFT_EDGE
+    scale = crop_w / WIDTH
+    left = left_edge_orig - TARGET_LEFT_EDGE * crop_w
+
+    # Vertical: center the crop vertically on the image
+    top = (orig_h - crop_h) / 2
 
     left = max(0, min(left, orig_w - crop_w))
     top = max(0, min(top, orig_h - crop_h))
 
+    return left, top, crop_w, crop_h
+
+
+def apply_crop(img: Image.Image, left: float, top: float,
+               crop_w: float, crop_h: float,
+               offset_x: float = 0, offset_y: float = 0) -> Image.Image:
+    """Apply a crop box with optional pixel offset, clamped to image bounds."""
+    orig_w, orig_h = img.size
+    left = left + offset_x
+    top = top + offset_y
+    left = max(0, min(left, orig_w - crop_w))
+    top = max(0, min(top, orig_h - crop_h))
     img = img.crop((int(left), int(top), int(left + crop_w), int(top + crop_h)))
     img = img.resize((WIDTH, HEIGHT), Image.LANCZOS)
     return img
+
+
+def crop_around_trunks(img: Image.Image, trunks: list[dict]) -> Image.Image:
+    """Crop image so the two trunks are centered in the frame at WIDTHxHEIGHT."""
+    left, top, crop_w, crop_h = compute_crop_box(img.size, trunks)
+    return apply_crop(img, left, top, crop_w, crop_h)
 
 
 def pick_reference_with_trunks(photos: list[tuple[datetime, str]]) -> tuple[np.ndarray, list[dict]] | None:
@@ -725,8 +761,8 @@ def main():
             print("Error: No photos with detectable trunks.")
             sys.exit(1)
 
-        # Smooth trunk positions with a rolling window
-        smooth_window = max(5, len(trunk_data) // 50)
+        # Smooth trunk positions with a large rolling window
+        smooth_window = max(7, len(trunk_data) // 10)
         if smooth_window % 2 == 0:
             smooth_window += 1
         left_edges = np.array([t[3][0]["inner_edge"] for t in trunk_data], dtype=np.float64)
@@ -745,11 +781,33 @@ def main():
 
         print(f"  Smoothed trunk positions (window={smooth_window})")
 
-        # Pass 2: crop and render using smoothed positions + sequential alignment
-        print("Pass 2: Rendering frames...")
-        seq_align_ok = 0
-        seq_align_fail = 0
-        prev_gray = None
+        # Pick a reference frame for alignment (use middle of kept frames)
+        ref_idx = len(trunk_data) // 2
+        ref_entry = trunk_data[ref_idx]
+        ref_img = Image.open(ref_entry[2]).convert("RGB")
+        try:
+            from PIL import ImageOps
+            ref_img = ImageOps.exif_transpose(ref_img)
+        except Exception:
+            pass
+        ref_smooth_trunks = [
+            {**ref_entry[3][0], "inner_edge": int(left_smooth[ref_idx]),
+             "centroid": (left_smooth[ref_idx] / 2, WORK_HEIGHT / 2),
+             "bottom_center": (left_smooth[ref_idx] / 2, WORK_HEIGHT)},
+            {**ref_entry[3][1], "inner_edge": int(right_smooth[ref_idx]),
+             "centroid": ((right_smooth[ref_idx] + WORK_WIDTH) / 2, WORK_HEIGHT / 2),
+             "bottom_center": ((right_smooth[ref_idx] + WORK_WIDTH) / 2, WORK_HEIGHT)},
+        ]
+        ref_img = crop_around_trunks(ref_img, ref_smooth_trunks)
+        ref_gray = cv2.cvtColor(pil_to_cv(ref_img), cv2.COLOR_BGR2GRAY)
+        print(f"  Alignment reference: {os.path.basename(ref_entry[2])}")
+
+        # Pass 2: rough crop, align to reference, collect offsets
+        print("Pass 2: Finding alignment offsets...")
+        align_ok = 0
+        align_fail = 0
+        # Store (crop_box, offset_x, offset_y, date, path) per frame
+        offset_data = []
     elif align:
         print("Setting up alignment (using middle photo as reference)...")
         ref_cv = pick_reference(photos)
@@ -762,13 +820,7 @@ def main():
     frame_count = 0
     with tempfile.TemporaryDirectory() as tmpdir:
         if tree_mode:
-            # Accumulated transform for sequential alignment
-            cum_tx, cum_ty = 0.0, 0.0
-            damping = 0.95  # slight drift correction toward center
-
-            # Collect all cropped/aligned frames and dates into arrays
-            raw_frames = []  # list of (cv_frame, date)
-
+            # Pass 2: rough crop each frame, find offset to reference
             for j, (orig_i, date, path, trunks) in enumerate(trunk_data):
                 try:
                     img = Image.open(path).convert("RGB")
@@ -778,7 +830,6 @@ def main():
                     except Exception:
                         pass
 
-                    # Build smoothed trunks for cropping
                     smooth_trunks = [
                         {**trunks[0], "inner_edge": int(left_smooth[j]),
                          "centroid": (left_smooth[j] / 2, WORK_HEIGHT / 2),
@@ -788,29 +839,26 @@ def main():
                          "bottom_center": ((right_smooth[j] + WORK_WIDTH) / 2, WORK_HEIGHT)},
                     ]
 
-                    img = crop_around_trunks(img, smooth_trunks)
-                    frame_cv = pil_to_cv(img)
+                    crop_box = compute_crop_box(img.size, smooth_trunks)
+                    rough_crop = apply_crop(img, *crop_box)
+                    frame_cv = pil_to_cv(rough_crop)
 
-                    # Sequential alignment to previous frame
-                    if prev_gray is not None:
-                        M, curr_gray = align_sequential(prev_gray, frame_cv,
-                                                        detector, center_mask,
-                                                        flann)
-                        if M is not None:
-                            cum_tx = cum_tx * damping + M[0, 2]
-                            cum_ty = cum_ty * damping + M[1, 2]
-                            M_cum = np.float64([[1, 0, cum_tx], [0, 1, cum_ty]])
-                            frame_cv = cv2.warpAffine(frame_cv, M_cum,
-                                                      (WIDTH, HEIGHT),
-                                                      borderMode=cv2.BORDER_REFLECT)
-                            seq_align_ok += 1
-                        else:
-                            seq_align_fail += 1
-                        prev_gray = cv2.cvtColor(frame_cv, cv2.COLOR_BGR2GRAY)
+                    # Find alignment offset to reference
+                    M, _ = align_sequential(ref_gray, frame_cv,
+                                            detector, center_mask, flann)
+                    ox, oy = 0.0, 0.0
+                    if M is not None:
+                        # Convert pixel offset in output coords back to
+                        # original image coords (scale by crop_w/WIDTH)
+                        scale_x = crop_box[2] / WIDTH
+                        scale_y = crop_box[3] / HEIGHT
+                        ox = -M[0, 2] * scale_x
+                        oy = -M[1, 2] * scale_y
+                        align_ok += 1
                     else:
-                        prev_gray = cv2.cvtColor(frame_cv, cv2.COLOR_BGR2GRAY)
+                        align_fail += 1
 
-                    raw_frames.append((frame_cv, date))
+                    offset_data.append((crop_box, ox, oy, date, path))
                 except Exception as e:
                     print(f"  Skipping {path}: {e}")
                     continue
@@ -819,16 +867,46 @@ def main():
                     print(f"  {j + 1}/{len(trunk_data)}")
 
             print(f"  Discarded {tree_discards}/{len(photos)} photos (no trunks detected)")
-            print(f"  Sequential alignment: {seq_align_ok} OK, {seq_align_fail} failed")
+            print(f"  Reference alignment: {align_ok} OK, {align_fail} failed")
 
-            # Write frames
-            for frame_cv, date in raw_frames:
-                img = cv_to_pil(frame_cv)
-                if not args.no_date:
-                    img = add_date_overlay(img, date)
-                frame_path = os.path.join(tmpdir, f"frame_{frame_count:06d}.jpg")
-                img.save(frame_path, "JPEG", quality=95)
-                frame_count += 1
+            # Smooth the offsets
+            if offset_data:
+                ox_raw = np.array([d[1] for d in offset_data])
+                oy_raw = np.array([d[2] for d in offset_data])
+                t_kernel = np.ones(smooth_window) / smooth_window
+                ox_smooth = np.convolve(ox_raw, t_kernel, mode="same")
+                oy_smooth = np.convolve(oy_raw, t_kernel, mode="same")
+                for k in range(half):
+                    w = k + half + 1
+                    ox_smooth[k] = np.mean(ox_raw[:w])
+                    oy_smooth[k] = np.mean(oy_raw[:w])
+                    ox_smooth[-(k + 1)] = np.mean(ox_raw[-w:])
+                    oy_smooth[-(k + 1)] = np.mean(oy_raw[-w:])
+                print(f"  Smoothed crop offsets (window={smooth_window})")
+
+            # Pass 3: re-crop with smoothed offsets baked in — no warping
+            print("Pass 3: Rendering with corrected crops...")
+            for j, (crop_box, _, _, date, path) in enumerate(offset_data):
+                try:
+                    img = Image.open(path).convert("RGB")
+                    try:
+                        from PIL import ImageOps
+                        img = ImageOps.exif_transpose(img)
+                    except Exception:
+                        pass
+
+                    img = apply_crop(img, crop_box[0], crop_box[1],
+                                     crop_box[2], crop_box[3],
+                                     ox_smooth[j], oy_smooth[j])
+
+                    if not args.no_date:
+                        img = add_date_overlay(img, date)
+                    frame_path = os.path.join(tmpdir, f"frame_{frame_count:06d}.jpg")
+                    img.save(frame_path, "JPEG", quality=95)
+                    frame_count += 1
+                except Exception as e:
+                    print(f"  Skipping {path}: {e}")
+                    continue
         else:
             print("Processing frames...")
             for i, (date, path) in enumerate(photos):
