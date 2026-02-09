@@ -337,6 +337,123 @@ def detect_wall_y(image: np.ndarray) -> float | None:
     return float(best_y)
 
 
+def detect_foreground_trunks(image: np.ndarray, wall_y: float) -> tuple[float, float] | None:
+    """Detect the two foreground tree trunks (J and K) at the wall line.
+
+    Uses zone-based detection: J is expected at 58-65% and K at 65-72%
+    of frame width. Finds the most prominent dark dip in each zone.
+
+    Returns (left_trunk_x, right_trunk_x) in WORK_WIDTH coords, or None.
+    """
+    from scipy.signal import find_peaks
+
+    work = cv2.resize(image, (WORK_WIDTH, WORK_HEIGHT))
+    gray = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
+
+    # Horizontal strip around the wall
+    strip_half = 20
+    wy = int(wall_y)
+    wall_strip = gray[max(0, wy - strip_half):wy + strip_half, :]
+
+    # Column brightness profile
+    col_brightness = np.mean(wall_strip, axis=0).astype(np.float64)
+    k = np.ones(5) / 5
+    col_smooth = np.convolve(col_brightness, k, mode="same")
+
+    # Search the full foreground region for all dark dips
+    fg_start = int(WORK_WIDTH * 0.45)
+    fg_end = int(WORK_WIDTH * 0.75)
+    fg_region = col_smooth[fg_start:fg_end]
+
+    inverted = fg_region.max() - fg_region
+    peaks, props = find_peaks(inverted, height=5, distance=10, prominence=5)
+
+    if len(peaks) == 0:
+        return None
+
+    # Convert peaks to absolute x positions
+    abs_peaks = fg_start + peaks
+    proms = props["prominences"]
+
+    # Zone-based detection: find best peak in each zone
+    # J zone: 58-65% of frame width
+    j_lo = int(WORK_WIDTH * 0.58)
+    j_hi = int(WORK_WIDTH * 0.65)
+    # K zone: 65-72% of frame width
+    k_lo = int(WORK_WIDTH * 0.65)
+    k_hi = int(WORK_WIDTH * 0.72)
+
+    j_best = None
+    j_prom = 0
+    k_best = None
+    k_prom = 0
+
+    for pi, (ax, pr) in enumerate(zip(abs_peaks, proms)):
+        if j_lo <= ax <= j_hi and pr > j_prom:
+            j_best = float(ax)
+            j_prom = pr
+        if k_lo <= ax <= k_hi and pr > k_prom:
+            k_best = float(ax)
+            k_prom = pr
+
+    if j_best is None or k_best is None:
+        return None
+
+    # Both should have reasonable prominence (actual tree trunks, not noise)
+    if j_prom < 8 or k_prom < 8:
+        return None
+
+    return (j_best, k_best)
+
+
+def warp_to_landmarks(image: np.ndarray, left_edge: float, right_edge: float,
+                      wall_y: float,
+                      output_size: tuple[int, int] = (WIDTH, HEIGHT)) -> np.ndarray:
+    """Warp image using full affine transform so detected landmarks map to
+    fixed output positions.
+
+    Uses 3 control points (left trunk at wall, right trunk at wall, midpoint
+    above wall) to correct scale, translation, AND rotation — keeping the
+    wall horizontal and both trunks at fixed positions every frame.
+    """
+    out_w, out_h = output_size
+    h, w = image.shape[:2]
+    sx = w / WORK_WIDTH
+    sy = h / WORK_HEIGHT
+
+    # Source points in original image coords
+    wall_y_orig = wall_y * sy
+    left_orig = left_edge * sx
+    right_orig = right_edge * sx
+    mid_x = (left_orig + right_orig) / 2
+
+    # 3rd point above midpoint — vertical offset proportional to trunk span
+    vert_offset = (right_orig - left_orig) * 0.5
+    src_pts = np.float32([
+        [left_orig, wall_y_orig],
+        [right_orig, wall_y_orig],
+        [mid_x, wall_y_orig - vert_offset],
+    ])
+
+    # Destination points at fixed output positions
+    dst_left_x = TARGET_LEFT_EDGE * out_w
+    dst_right_x = TARGET_RIGHT_EDGE * out_w
+    dst_wall_y = TARGET_WALL_Y * out_h
+    dst_mid_x = (dst_left_x + dst_right_x) / 2
+    dst_vert_offset = (dst_right_x - dst_left_x) * 0.5
+
+    dst_pts = np.float32([
+        [dst_left_x, dst_wall_y],
+        [dst_right_x, dst_wall_y],
+        [dst_mid_x, dst_wall_y - dst_vert_offset],
+    ])
+
+    M = cv2.getAffineTransform(src_pts, dst_pts)
+
+    return cv2.warpAffine(image, M, output_size,
+                          flags=cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_REFLECT)
+
+
 def compute_trunk_alignment(trunks: list[dict], ref_trunks: list[dict],
                             frame_shape: tuple[int, int]) -> np.ndarray | None:
     """Compute affine transform to align frame trunks to reference trunks.
@@ -568,9 +685,10 @@ def make_center_mask(width: int, height: int) -> np.ndarray:
     return mask
 
 
-# Target positions for trunk inner edges in output frame (fraction of WIDTH)
-TARGET_LEFT_EDGE = 0.15   # left trunk inner edge at 15% from left
-TARGET_RIGHT_EDGE = 0.85  # right trunk inner edge at 85% from left
+# Target positions for landmarks in output frame (fraction of WIDTH/HEIGHT)
+# Big tree trunks at edges, wall as horizontal anchor
+TARGET_LEFT_EDGE = 0.05   # left trunk inner edge at 5% from left
+TARGET_RIGHT_EDGE = 0.95  # right trunk inner edge at 95% from left
 TARGET_WALL_Y = 0.45      # wall at 45% down from top of output frame
 
 
@@ -850,114 +968,31 @@ def main():
     ref_trunks = None
 
     if tree_mode:
-        print("Setting up tree-trunk detection...")
-        detector = cv2.SIFT_create(nfeatures=3000)
-        flann_index = dict(algorithm=1, trees=5)  # FLANN_INDEX_KDTREE
-        flann_search = dict(checks=50)
-        flann = cv2.FlannBasedMatcher(flann_index, flann_search)
+        print("Setting up feature-based alignment...")
         center_mask = make_center_mask(WIDTH, HEIGHT)
 
-        # Initialize LightGlue if available
-        lg_extractor = None
-        lg_matcher = None
-        if HAS_LIGHTGLUE:
-            device_name = "GPU" if DEVICE.type == "cuda" else "CPU"
-            print(f"  LightGlue available — using deep learning alignment ({device_name})")
-            lg_extractor = SuperPoint(max_num_keypoints=2048).eval().to(DEVICE)
-            lg_matcher = LightGlue(features="superpoint").eval().to(DEVICE)
-        else:
-            print("  LightGlue not available — using SIFT+FLANN")
-        if args.tree_debug:
-            debug_dir = os.path.join(os.path.dirname(args.output) or ".", "tree_debug")
-            os.makedirs(debug_dir, exist_ok=True)
-            print(f"  Debug images will be saved to {debug_dir}/")
-
-        # Pass 1: detect trunks in all photos
-        print("Pass 1: Detecting trunks...")
-        trunk_data = []  # (index, date, path, trunks)
-        tree_discards = 0
-        for i, (date, path) in enumerate(photos):
-            try:
-                img = Image.open(path).convert("RGB")
-                try:
-                    from PIL import ImageOps
-                    img = ImageOps.exif_transpose(img)
-                except Exception:
-                    pass
-                cv_img = pil_to_cv(img)
-                trunks = detect_trunks(cv_img)
-
-                if args.tree_debug:
-                    debug_draw_trunks(cv_img, trunks, path, debug_dir)
-
-                if trunks is None:
-                    tree_discards += 1
-                else:
-                    wall_y = detect_wall_y(cv_img)
-                    trunk_data.append((i, date, path, trunks, wall_y))
-            except Exception as e:
-                print(f"  Skipping {path}: {e}")
-                tree_discards += 1
-
-            if (i + 1) % 100 == 0 or i == len(photos) - 1:
-                print(f"  {i + 1}/{len(photos)}")
-
-        print(f"  Kept {len(trunk_data)}, discarded {tree_discards}")
-
-        if not trunk_data:
-            print("Error: No photos with detectable trunks.")
+        if not HAS_LIGHTGLUE:
+            print("  Error: LightGlue is required for --tree-detect mode")
             sys.exit(1)
 
-        # Smooth trunk positions and wall y with a large rolling window
-        smooth_window = max(7, len(trunk_data) // 10)
-        if smooth_window % 2 == 0:
-            smooth_window += 1
-        left_edges = np.array([t[3][0]["inner_edge"] for t in trunk_data], dtype=np.float64)
-        right_edges = np.array([t[3][1]["inner_edge"] for t in trunk_data], dtype=np.float64)
+        device_name = "GPU" if DEVICE.type == "cuda" else "CPU"
+        print(f"  LightGlue ({device_name})")
+        lg_extractor = SuperPoint(max_num_keypoints=2048).eval().to(DEVICE)
+        lg_matcher = LightGlue(features="superpoint").eval().to(DEVICE)
 
-        # Wall y: fill missing detections with interpolation
-        raw_wall_y = [t[4] for t in trunk_data]
-        wall_detected = sum(1 for w in raw_wall_y if w is not None)
-        if wall_detected > len(trunk_data) * 0.5:
-            # Enough wall detections — interpolate missing values
-            median_wall = np.median([w for w in raw_wall_y if w is not None])
-            wall_y_arr = np.array([w if w is not None else median_wall for w in raw_wall_y],
-                                  dtype=np.float64)
-            use_wall = True
-            print(f"  Wall detected in {wall_detected}/{len(trunk_data)} frames")
-        else:
-            wall_y_arr = None
-            use_wall = False
-            print(f"  Wall detected in only {wall_detected}/{len(trunk_data)} frames — not using")
-
-        kernel = np.ones(smooth_window) / smooth_window
-        left_smooth = np.convolve(left_edges, kernel, mode="same")
-        right_smooth = np.convolve(right_edges, kernel, mode="same")
-        if use_wall:
-            wall_smooth = np.convolve(wall_y_arr, kernel, mode="same")
-        # Fix edges of convolution
-        half = smooth_window // 2
-        for j in range(half):
-            w = j + half + 1
-            left_smooth[j] = np.mean(left_edges[:w])
-            right_smooth[j] = np.mean(right_edges[:w])
-            left_smooth[-(j + 1)] = np.mean(left_edges[-w:])
-            right_smooth[-(j + 1)] = np.mean(right_edges[-w:])
-            if use_wall:
-                wall_smooth[j] = np.mean(wall_y_arr[:w])
-                wall_smooth[-(j + 1)] = np.mean(wall_y_arr[-w:])
-
-        print(f"  Smoothed positions (window={smooth_window})")
-
-        # Pick a reference frame for alignment (use middle of kept frames)
-        ref_idx = len(trunk_data) // 2
-        ref_entry = trunk_data[ref_idx]
-        ref_img = Image.open(ref_entry[2]).convert("RGB")
+        # Reference frame (middle of sequence)
+        ref_idx = len(photos) // 2
+        ref_date, ref_path = photos[ref_idx]
+        print(f"  Reference: {os.path.basename(ref_path)} ({ref_date.strftime('%Y-%m-%d')})")
+        ref_pil = Image.open(ref_path).convert("RGB")
         try:
             from PIL import ImageOps
-            ref_img = ImageOps.exif_transpose(ref_img)
+            ref_pil = ImageOps.exif_transpose(ref_pil)
         except Exception:
             pass
+        ref_pil = resize_and_crop(ref_pil)
+        ref_cv = pil_to_cv(ref_pil)
+        ref_gray = cv2.cvtColor(ref_cv, cv2.COLOR_BGR2GRAY)
     elif align:
         print("Setting up alignment (using middle photo as reference)...")
         ref_cv = pick_reference(photos)
@@ -970,9 +1005,98 @@ def main():
     frame_count = 0
     with tempfile.TemporaryDirectory() as tmpdir:
         if tree_mode:
-            # Pass 2: crop each frame using smoothed trunk + wall positions
-            print("Pass 2: Rendering frames (landmark-locked crops)...")
-            for j, (orig_i, date, path, trunks, _wall_y_raw) in enumerate(trunk_data):
+            # Align each frame to reference using LightGlue feature matching
+            # Process outward from reference in both directions to minimize chain drift
+            print("Aligning and rendering frames...")
+            transforms = [None] * len(photos)
+            transforms[ref_idx] = np.eye(2, 3, dtype=np.float64)
+
+            def _chain_affine(M_prev, M_seq):
+                """Chain affine transforms: M_seq (curr→prev) then M_prev (prev→ref)."""
+                A1 = np.vstack([M_seq, [0, 0, 1]])
+                A2 = np.vstack([M_prev, [0, 0, 1]])
+                return (A2 @ A1)[:2, :]
+
+            def _load_gray(path):
+                img = Image.open(path).convert("RGB")
+                try:
+                    from PIL import ImageOps
+                    img = ImageOps.exif_transpose(img)
+                except Exception:
+                    pass
+                img = resize_and_crop(img)
+                return cv2.cvtColor(pil_to_cv(img), cv2.COLOR_BGR2GRAY)
+
+            direct_ok = 0
+            chain_ok = 0
+            failures = 0
+
+            # Forward from reference (ref+1, ref+2, ...)
+            prev_gray = ref_gray
+            prev_M = transforms[ref_idx]
+            for i in range(ref_idx + 1, len(photos)):
+                date, path = photos[i]
+                try:
+                    frame_gray = _load_gray(path)
+                    M = _lightglue_match(ref_gray, frame_gray,
+                                         lg_extractor, lg_matcher, center_mask)
+                    if M is not None:
+                        transforms[i] = M
+                        direct_ok += 1
+                    else:
+                        M_seq = _lightglue_match(prev_gray, frame_gray,
+                                                 lg_extractor, lg_matcher, center_mask)
+                        if M_seq is not None:
+                            transforms[i] = _chain_affine(prev_M, M_seq)
+                            chain_ok += 1
+                        else:
+                            failures += 1
+                    if transforms[i] is not None:
+                        prev_gray = frame_gray
+                        prev_M = transforms[i]
+                except Exception as e:
+                    print(f"  Skipping {path}: {e}")
+                    failures += 1
+                if (i - ref_idx) % 50 == 0:
+                    print(f"  Forward: {i - ref_idx}/{len(photos) - ref_idx - 1}")
+
+            # Backward from reference (ref-1, ref-2, ...)
+            prev_gray = ref_gray
+            prev_M = transforms[ref_idx]
+            for i in range(ref_idx - 1, -1, -1):
+                date, path = photos[i]
+                try:
+                    frame_gray = _load_gray(path)
+                    M = _lightglue_match(ref_gray, frame_gray,
+                                         lg_extractor, lg_matcher, center_mask)
+                    if M is not None:
+                        transforms[i] = M
+                        direct_ok += 1
+                    else:
+                        M_seq = _lightglue_match(prev_gray, frame_gray,
+                                                 lg_extractor, lg_matcher, center_mask)
+                        if M_seq is not None:
+                            transforms[i] = _chain_affine(prev_M, M_seq)
+                            chain_ok += 1
+                        else:
+                            failures += 1
+                    if transforms[i] is not None:
+                        prev_gray = frame_gray
+                        prev_M = transforms[i]
+                except Exception as e:
+                    print(f"  Skipping {path}: {e}")
+                    failures += 1
+                if (ref_idx - i) % 50 == 0:
+                    print(f"  Backward: {ref_idx - i}/{ref_idx}")
+
+            print(f"  Alignment: {direct_ok} direct, {chain_ok} chained, {failures} failed")
+
+            # Render aligned frames
+            print("Rendering frames...")
+            for i, (date, path) in enumerate(photos):
+                M = transforms[i]
+                if M is None:
+                    continue
                 try:
                     img = Image.open(path).convert("RGB")
                     try:
@@ -980,19 +1104,12 @@ def main():
                         img = ImageOps.exif_transpose(img)
                     except Exception:
                         pass
-
-                    smooth_trunks = [
-                        {**trunks[0], "inner_edge": int(left_smooth[j]),
-                         "centroid": (left_smooth[j] / 2, WORK_HEIGHT / 2),
-                         "bottom_center": (left_smooth[j] / 2, WORK_HEIGHT)},
-                        {**trunks[1], "inner_edge": int(right_smooth[j]),
-                         "centroid": ((right_smooth[j] + WORK_WIDTH) / 2, WORK_HEIGHT / 2),
-                         "bottom_center": ((right_smooth[j] + WORK_WIDTH) / 2, WORK_HEIGHT)},
-                    ]
-
-                    frame_wall_y = wall_smooth[j] if use_wall else None
-                    crop_box = compute_crop_box(img.size, smooth_trunks, frame_wall_y)
-                    img = apply_crop(img, *crop_box)
+                    img = resize_and_crop(img)
+                    frame_cv = pil_to_cv(img)
+                    aligned = cv2.warpAffine(frame_cv, M, (WIDTH, HEIGHT),
+                                             flags=cv2.INTER_LANCZOS4,
+                                             borderMode=cv2.BORDER_REFLECT)
+                    img = cv_to_pil(aligned)
 
                     if not args.no_date:
                         img = add_date_overlay(img, date)
@@ -1003,10 +1120,10 @@ def main():
                     print(f"  Skipping {path}: {e}")
                     continue
 
-                if (j + 1) % 100 == 0 or j == len(trunk_data) - 1:
-                    print(f"  {j + 1}/{len(trunk_data)}")
+                if (i + 1) % 100 == 0 or i == len(photos) - 1:
+                    print(f"  {i + 1}/{len(photos)}")
 
-            print(f"  Discarded {tree_discards}/{len(photos)} photos (no trunks detected)")
+            print(f"  Rendered {frame_count} frames ({failures} skipped)")
         else:
             print("Processing frames...")
             for i, (date, path) in enumerate(photos):
